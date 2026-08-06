@@ -30,7 +30,7 @@
     "prepublishOnly": "npm run build && npm run test",
     "test": "npm run build && node --experimental-vm-modules test/*.test.mjs",
     "check": "npm run build && npm run test",
-    "postinstall": "npm run build"
+    "postinstall": "node -e \"if (require('node:fs').existsSync('node_modules/.bin/tsc')) require('node:child_process').execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', 'build'], { stdio: 'inherit' })\""
   },
   "publishConfig": {
     "access": "public"
