@@ -32,6 +32,7 @@ import {
   repairTruncatedJSON,
   scavengeToolCalls,
   detectCallStorm,
+  escalateLoopGuards,
 } from "../src/repair.js";
 import type { ReasonixStats, DeepSeekChatMessage } from "../src/types.js";
 
@@ -132,6 +133,7 @@ export default async function (pi: ExtensionAPI) {
     callsRepaired: 0,
     callsScavenged: 0,
     stormsSuppressed: 0,
+    loopGuardNotices: 0,
     resultsCompacted: 0,
     conversationTruncations: 0,
     totalTurns: 0,
@@ -141,6 +143,19 @@ export default async function (pi: ExtensionAPI) {
   let isDeepSeekSession = false;
   let prefixHash = "";
   let currentModel = "";
+
+  /**
+   * Tool names seen on the most recent `before_provider_request`. Used to
+   * filter scavenged calls to tools the session actually exposes.
+   */
+  let knownToolNames = new Set<string>();
+
+  /**
+   * Per-key (name|args) suppression counts for loop-guard escalation.
+   * Persists across messages so a death-spiral spanning several turns is
+   * still surfaced to the model.
+   */
+  const stormRepeatCounts = new Map<string, number>();
 
   /**
    * Header-derived cache tokens for the current provider response.
@@ -240,6 +255,22 @@ export default async function (pi: ExtensionAPI) {
 
       const messages = payload.messages as DeepSeekChatMessage[] | undefined;
       if (!messages || messages.length === 0) return;
+
+      // Snapshot the tool names this session exposes. Scavenging at
+      // message_end filters recovered calls against this list.
+      if (Array.isArray(payload.tools)) {
+        knownToolNames = new Set(
+          payload.tools
+            .map((t) => {
+              const tool = t as {
+                name?: string;
+                function?: { name?: string };
+              };
+              return tool?.function?.name ?? tool?.name ?? "";
+            })
+            .filter(Boolean),
+        );
+      }
 
       let working = messages;
 
@@ -351,53 +382,63 @@ export default async function (pi: ExtensionAPI) {
       if (!isDeepSeekSession || msg.role !== "assistant") return;
       const content = msg.content;
       if (!Array.isArray(content)) return;
-      const toolCalls = content.filter(
-        (c: Record<string, unknown>) => c?.type === "toolCall",
-      );
-      if (toolCalls.length === 0) return;
 
       try {
         // Pass 1 — repair truncated JSON arguments (string args only).
-        for (const tc of toolCalls as Array<Record<string, unknown>>) {
-          if (typeof tc.arguments === "string") {
-            const { repaired, fixed } = repairTruncatedJSON(tc.arguments);
-            if (fixed) {
-              tc.arguments = repaired;
-              stats.callsRepaired++;
-            }
+        for (const tc of content as Array<Record<string, unknown>>) {
+          if (tc.type !== "toolCall" || typeof tc.arguments !== "string") {
+            continue;
+          }
+          const { repaired, fixed } = repairTruncatedJSON(tc.arguments);
+          if (fixed) {
+            tc.arguments = repaired;
+            stats.callsRepaired++;
           }
         }
 
         // Pass 2 — scavenge tool calls leaked into reasoning content.
         // Opt-in (REASONIX_SCAVENGE=1): appending calls mutates the batch.
+        // Runs even when no structured tool calls exist — reasoning-only
+        // leaks are the exact failure mode this pass exists for.
         if (SCAVENGE_ENABLED) {
           const reasoning =
             (msg.reasoning as string | null | undefined) ??
             (msg.reasoning_content as string | null | undefined) ??
             null;
           if (reasoning) {
-            const scavenged = scavengeToolCalls(String(reasoning));
+            const scavenged = scavengeToolCalls(String(reasoning), {
+              knownTools:
+                knownToolNames.size > 0 ? knownToolNames : undefined,
+            });
             const existing = new Set(
-              (toolCalls as Array<Record<string, unknown>>).map(
-                (tc) => tc.id as string,
-              ),
+              (content as Array<Record<string, unknown>>)
+                .filter((c) => c.type === "toolCall")
+                .map((tc) =>
+                  toolCallKey(tc.name as string | undefined, tc.arguments),
+                ),
             );
             for (const call of scavenged) {
-              if (existing.has(call.id)) continue;
+              const key = toolCallKey(call.function.name, call.function.arguments);
+              if (existing.has(key)) continue;
               content.push({
                 type: "toolCall",
                 id: call.id,
                 name: call.function.name,
                 arguments: call.function.arguments,
               });
-              existing.add(call.id);
+              existing.add(key);
               stats.callsScavenged++;
             }
           }
         }
 
-        // Pass 3 — storm suppression: drop exact (name, args) repeats
-        // within a sliding window. Rebuilt with detectCallStorm semantics.
+        // Pass 3 — storm suppression over the full post-scavenge batch, so
+        // scavenged calls are visible to storm detection and survive its
+        // content rebuild.
+        const toolCalls = (content as Array<Record<string, unknown>>).filter(
+          (c) => c.type === "toolCall",
+        );
+        if (toolCalls.length === 0) return;
         const inputs = (toolCalls as Array<Record<string, unknown>>).map(
           (tc) => ({
             id: tc.id as string,
@@ -411,13 +452,31 @@ export default async function (pi: ExtensionAPI) {
             },
           }),
         );
-        const { clean, stormCount } = detectCallStorm(inputs, 5);
+        const { clean, stormCount, suppressedKeys } = detectCallStorm(inputs, 5);
         if (stormCount > 0) {
           const cleanIds = new Set(clean.map((c) => c.id));
           // Rebuild content keeping non-toolCall blocks untouched.
-          msg.content = (content as Array<Record<string, unknown>>).filter(
+          const rebuilt = (content as Array<Record<string, unknown>>).filter(
             (c) => c.type !== "toolCall" || cleanIds.has(c.id as string),
           );
+          // Escalation visibility: once the same repeat is suppressed past a
+          // threshold, append a [loop guard] notice so the model sees the
+          // suppression instead of it being silent.
+          const flagged = escalateLoopGuards(suppressedKeys, stormRepeatCounts);
+          if (flagged.length > 0) {
+            const names = [
+              ...new Set(flagged.map((k) => k.split("|")[0])),
+            ].join(", ");
+            const maxCount = Math.max(
+              ...flagged.map((k) => stormRepeatCounts.get(k) ?? 0),
+            );
+            rebuilt.push({
+              type: "text",
+              text: `[loop guard] ${names} suppressed: identical call repeated ${maxCount} times. Re-sending it — even reworded — will not help. Change approach or explain the blocker in your final answer.`,
+            });
+            stats.loopGuardNotices++;
+          }
+          msg.content = rebuilt;
           stats.stormsSuppressed += stormCount;
         }
       } catch {
@@ -450,6 +509,7 @@ export default async function (pi: ExtensionAPI) {
       logTracker.reset();
       prefixHash = "";
     }
+    stormRepeatCounts.clear();
     pendingHeaderTokens = null;
   });
 
@@ -487,6 +547,7 @@ export default async function (pi: ExtensionAPI) {
         `    Args repaired:     ${stats.callsRepaired}`,
         `    Calls scavenged:   ${stats.callsScavenged}`,
         `    Storms suppressed: ${stats.stormsSuppressed}`,
+        `    Loop guard notices: ${stats.loopGuardNotices}`,
         "",
         "  💰 Cost Control",
         `    Results compacted: ${stats.resultsCompacted}`,

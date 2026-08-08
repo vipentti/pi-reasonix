@@ -223,6 +223,81 @@ describe("scavengeToolCalls", () => {
     assert.equal(result.length, 1);
     assert.equal(result[0].function.name, "search");
   });
+
+  it("recovers string-form arguments", async () => {
+    const { scavengeToolCalls } = await import("../dist/src/repair.js");
+    const result = scavengeToolCalls(
+      '<think>{"function": {"name": "bash", "arguments": "{\\"command\\":\\"ls\\"}"}}</think>',
+    );
+    assert.equal(result.length, 1);
+    assert.equal(result[0].function.name, "bash");
+    assert.equal(result[0].function.arguments, '{"command":"ls"}');
+  });
+
+  it("recovers calls with nested object arguments", async () => {
+    const { scavengeToolCalls } = await import("../dist/src/repair.js");
+    const result = scavengeToolCalls(
+      '{"function": {"name": "bash", "arguments": {"cmd": "echo hi", "env": {"A": "B"}}}}',
+    );
+    assert.equal(result.length, 1);
+    assert.deepEqual(JSON.parse(result[0].function.arguments), {
+      cmd: "echo hi",
+      env: { A: "B" },
+    });
+  });
+
+  it("drops malformed candidates", async () => {
+    const { scavengeToolCalls } = await import("../dist/src/repair.js");
+    const result = scavengeToolCalls(
+      '{"function": {"name": "bash", "arguments": "{oops"}}, ' +
+        '{"function": {"name": 42, "arguments": {}}}, ' +
+        '{"function": {"name": "read"}}, ' +
+        '{"name": "search", "arguments": {"q": "ok"}}',
+    );
+    assert.equal(result.length, 1);
+    assert.equal(result[0].function.name, "search");
+  });
+
+  it("filters candidates to known tools when a list is available", async () => {
+    const { scavengeToolCalls } = await import("../dist/src/repair.js");
+    const text =
+      '<think>{"function": {"name": "bash", "arguments": {"command": "ls"}}} ' +
+      '{"function": {"name": "read", "arguments": {"path": "a"}}}</think>';
+
+    const all = scavengeToolCalls(text);
+    assert.equal(all.length, 2);
+
+    const filtered = scavengeToolCalls(text, { knownTools: ["read"] });
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0].function.name, "read");
+
+    // An empty/absent list keeps extraction with strict JSON validation.
+    const none = scavengeToolCalls(text, { knownTools: [] });
+    assert.equal(none.length, 2);
+  });
+
+  it("skips duplicate (name, arguments) candidates within a message", async () => {
+    const { scavengeToolCalls } = await import("../dist/src/repair.js");
+    const result = scavengeToolCalls(
+      '<think>{"function": {"name": "read", "arguments": {"path": "a"}}} ' +
+        'and again {"name": "read", "arguments": {"path": "a"}}</think>',
+    );
+    assert.equal(result.length, 1);
+    assert.equal(result[0].function.name, "read");
+  });
+
+  it("preserves coverage across thinks, fences, function and bare forms", async () => {
+    const { scavengeToolCalls } = await import("../dist/src/repair.js");
+    const result = scavengeToolCalls(
+      '```json\n{"function": {"name": "search", "arguments": {"q": "fence"}}}\n``` ' +
+        'and inline bare {"name": "edit", "arguments": {"path": "x"}}',
+    );
+    assert.equal(result.length, 2);
+    assert.deepEqual(
+      result.map((c) => c.function.name).sort(),
+      ["edit", "search"],
+    );
+  });
 });
 
 describe("detectCallStorm", () => {
@@ -239,6 +314,51 @@ describe("detectCallStorm", () => {
     // calls[2] has path=b which is different — kept
     assert.equal(result.stormCount, 2);
     assert.equal(result.clean.length, 2);
+  });
+
+  it("returns the keys of suppressed calls", async () => {
+    const { detectCallStorm } = await import("../dist/src/repair.js");
+    const result = detectCallStorm([
+      { id: "1", function: { name: "read", arguments: '{"path":"x"}' } },
+      { id: "2", function: { name: "read", arguments: '{"path":"x"}' } },
+      { id: "3", function: { name: "bash", arguments: '{"command":"ls"}' } },
+    ]);
+    assert.equal(result.stormCount, 1);
+    assert.deepEqual(result.suppressedKeys, ['read|{"path":"x"}']);
+    assert.equal(result.clean.length, 2);
+  });
+
+  it("does not catch re-worded arguments (documented pi gap)", async () => {
+    // pi exposes no tool-execution error class at message_end, so storm
+    // keying stays exact (name, arguments). A loop that re-words arguments
+    // each turn is deliberately left untouched.
+    const { detectCallStorm } = await import("../dist/src/repair.js");
+    const result = detectCallStorm([
+      { id: "1", function: { name: "bash", arguments: '{"command":"ls a"}' } },
+      { id: "2", function: { name: "bash", arguments: '{"command":"ls a -la"}' } },
+      { id: "3", function: { name: "bash", arguments: '{"command":"ls --all a"}' } },
+    ]);
+    assert.equal(result.stormCount, 0);
+    assert.equal(result.clean.length, 3);
+    assert.deepEqual(result.suppressedKeys, []);
+  });
+});
+
+describe("escalateLoopGuards", () => {
+  it("flags a key once it crosses the threshold and updates counts", async () => {
+    const { escalateLoopGuards } = await import("../dist/src/repair.js");
+    const counts = new Map();
+
+    const flagged = escalateLoopGuards(
+      ['read|{"path":"x"}', 'read|{"path":"x"}', 'read|{"path":"x"}'],
+      counts,
+    );
+    assert.deepEqual(flagged, ['read|{"path":"x"}']);
+    assert.equal(counts.get('read|{"path":"x"}'), 3);
+
+    // Suppression beyond the threshold does not re-flag the same key.
+    assert.deepEqual(escalateLoopGuards(['read|{"path":"x"}'], counts), []);
+    assert.equal(counts.get('read|{"path":"x"}'), 4);
   });
 });
 

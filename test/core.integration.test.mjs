@@ -29,6 +29,10 @@ import {
   estimateContextUsage,
 } from "../dist/src/cost-control.js";
 
+// Scavenge is opt-in via env. Enable it for the whole file so the wiring
+// tests can exercise the scavenge pass; the flag is read once at module load.
+process.env.REASONIX_SCAVENGE = "1";
+
 /** Minimal shape for test messages. */
 function msg(overrides) {
   return { role: "user", content: "", ...overrides };
@@ -70,6 +74,32 @@ async function loadExtension() {
   const ext = (await import("../dist/extensions/index.js")).default;
   await ext(api);
   return { api, captured };
+}
+
+// A fresh extension instance per test: node caches ESM modules, so a plain
+// dynamic import reuses the previous closure (stats, storm repeat counts,
+// known-tool list). A query string forces a distinct module entry.
+let _fresh = 0;
+async function loadFreshExtension() {
+  const { api, captured } = createMockAPI();
+  const url = new URL(
+    `../dist/extensions/index.js?v=${++_fresh}`,
+    import.meta.url,
+  ).href;
+  const ext = (await import(url)).default;
+  await ext(api);
+  return { api, captured };
+}
+
+/** Set a DeepSeek session and stash the known-tool list via the payload hook. */
+function seedSession(handler, tools) {
+  handler({
+    payload: {
+      model: "deepseek-v4-flash",
+      messages: [{ role: "user", content: "hi" }],
+      tools,
+    },
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,6 +351,169 @@ describe("message_end tool-call repair", () => {
     };
 
     assert.doesNotThrow(() => handler({ message }));
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Scavenge wiring (REASONIX_SCAVENGE=1)                              */
+/* ------------------------------------------------------------------ */
+
+describe("scavenge wiring", () => {
+  it("filters reasoning leaks to the known-tool list and counts additions", async () => {
+    const { api } = await loadFreshExtension();
+    const bpr = api._handlers.get("before_provider_request");
+    const me = api._handlers.get("message_end");
+    const status = api._handlers.get("cmd:reasonix-status");
+
+    seedSession(bpr, [
+      { type: "function", function: { name: "read", parameters: {} } },
+    ]);
+
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      reasoning:
+        '<think>{"function": {"name": "bash", "arguments": {"command": "ls"}}} ' +
+        '{"function": {"name": "read", "arguments": {"path": "b.txt"}}}</think>',
+    };
+    me({ message });
+
+    const calls = message.content.filter((c) => c.type === "toolCall");
+    assert.equal(calls.length, 1, "bash should be filtered by known-tool list");
+    assert.equal(calls[0].name, "read");
+    assert.equal(calls[0].arguments, '{"path":"b.txt"}');
+
+    let rendered = "";
+    await status("", { ui: { notify: (m) => { rendered = m; } } });
+    const scavenged = rendered.match(/Calls scavenged:\s+(\d+)/);
+    assert(scavenged, "status missing scavenged counter");
+    assert.equal(scavenged[1], "1", "counter counts added calls only");
+  });
+
+  it("scavenges reasoning-only messages with no structured calls", async () => {
+    const { api } = await loadFreshExtension();
+    const bpr = api._handlers.get("before_provider_request");
+    const me = api._handlers.get("message_end");
+
+    seedSession(bpr, [
+      { type: "function", function: { name: "search", parameters: {} } },
+    ]);
+
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "thinking..." }],
+      reasoning: '<think>{"name": "search", "arguments": {"q": "x"}}</think>',
+    };
+    me({ message });
+
+    const calls = message.content.filter((c) => c.type === "toolCall");
+    assert.equal(calls.length, 1, "reasoning-only leak must be recovered");
+    assert.equal(calls[0].name, "search");
+  });
+
+  it("skips a scavenged call that duplicates an existing (name, arguments)", async () => {
+    const { api } = await loadFreshExtension();
+    const bpr = api._handlers.get("before_provider_request");
+    const me = api._handlers.get("message_end");
+
+    seedSession(bpr, [
+      { type: "function", function: { name: "read", parameters: {} } },
+    ]);
+
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "1", name: "read", arguments: '{"path":"a.txt"}' },
+      ],
+      reasoning:
+        '<think>{"function": {"name": "read", "arguments": {"path": "a.txt"}}}</think>',
+    };
+    me({ message });
+
+    const calls = message.content.filter((c) => c.type === "toolCall");
+    assert.equal(calls.length, 1, "duplicate (name, args) must not be appended");
+    assert.equal(calls[0].id, "1");
+  });
+
+  it("keeps scavenged calls when storm suppression fires", async () => {
+    const { api } = await loadFreshExtension();
+    const bpr = api._handlers.get("before_provider_request");
+    const me = api._handlers.get("message_end");
+
+    seedSession(bpr, [
+      { type: "function", function: { name: "read", parameters: {} } },
+      { type: "function", function: { name: "search", parameters: {} } },
+    ]);
+
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "1", name: "read", arguments: '{"path":"x"}' },
+        { type: "toolCall", id: "2", name: "read", arguments: '{"path":"x"}' },
+      ],
+      reasoning: '<think>{"function": {"name": "search", "arguments": {"q": "y"}}}</think>',
+    };
+    me({ message });
+
+    const calls = message.content.filter((c) => c.type === "toolCall");
+    assert.equal(calls.length, 2, "scavenged call must survive storm rebuild");
+    assert.deepEqual(
+      calls.map((c) => c.name).sort(),
+      ["read", "search"],
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Loop-guard escalation wiring                                       */
+/* ------------------------------------------------------------------ */
+
+describe("loop-guard escalation wiring", () => {
+  it("appends a [loop guard] notice after suppressing a repeat past threshold", async () => {
+    const { api } = await loadFreshExtension();
+    const bpr = api._handlers.get("before_provider_request");
+    const me = api._handlers.get("message_end");
+
+    seedSession(bpr, []);
+
+    const message = {
+      role: "assistant",
+      content: Array.from({ length: 5 }, (_, i) => ({
+        type: "toolCall",
+        id: String(i + 1),
+        name: "read",
+        arguments: '{"path":"guard"}',
+      })),
+    };
+    me({ message });
+
+    const calls = message.content.filter((c) => c.type === "toolCall");
+    const texts = message.content.filter((c) => c.type === "text");
+    assert.equal(calls.length, 1, "four identical calls suppressed");
+    assert.equal(calls[0].id, "1");
+    assert.equal(texts.length, 1, "loop guard notice must be appended");
+    assert(
+      texts[0].text.startsWith("[loop guard]"),
+      "notice should start with [loop guard]",
+    );
+  });
+
+  it("leaves object-argument calls untouched", async () => {
+    const { api } = await loadFreshExtension();
+    const bpr = api._handlers.get("before_provider_request");
+    const me = api._handlers.get("message_end");
+
+    seedSession(bpr, []);
+
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.txt" } },
+      ],
+    };
+    me({ message });
+
+    assert.deepEqual(message.content[0].arguments, { path: "a.txt" });
   });
 });
 
