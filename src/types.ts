@@ -19,7 +19,6 @@ export interface RepairReport {
   original: ToolCallRepairInput[];
   repaired: ToolCallRepairInput[];
   scavenged: ToolCallRepairInput[];
-  flattened: boolean;
   truncated: boolean;
   storms: number;
 }
