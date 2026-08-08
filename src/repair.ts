@@ -14,84 +14,96 @@
 
 import type { ToolCallRepairInput } from "./types.js";
 
-/* ------------------------------------------------------------------ */
-/*  Pass 1: flatten — simplify deep / wide parameter schemas           */
-/* ------------------------------------------------------------------ */
-
-interface ParamNode {
-  name: string;
-  type: string;
-  depth: number;
-  isRequired?: boolean;
-  description?: string;
-}
-
-/** Detect whether a schema would benefit from flattening. */
-export function needsFlattening(
-  paramNames: string[],
-  depth: number,
-): boolean {
-  return paramNames.length > 10 || depth > 2;
-}
-
 /**
- * Flatten a deep parameter name by joining with dots.
- * E.g. `style.color` instead of `style: { color: "red" }`.
+ * Port of original closeTruncatedJSON (internal/provider/provider.go:524-574).
+ * String-aware stack, tracks inStr/escape, closes unterminated strings,
+ * trims trailing ',' / ':' with null fill, '{}' fallback.
  */
-export function flattenParamName(path: string[]): string {
-  return path.join(".");
+function closeTruncatedJSON(s: string): string {
+  const stack: string[] = [];
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (c === "\\") {
+        esc = true;
+      } else if (c === '"') {
+        inStr = false;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+    } else if (c === "{") {
+      stack.push("}");
+    } else if (c === "[") {
+      stack.push("]");
+    } else if (c === "}" || c === "]") {
+      if (stack.length > 0) stack.pop();
+    }
+  }
+  let out = s;
+  if (esc) out = out.slice(0, -1);
+  if (inStr) out += '"';
+  const trimmed = out.trimEnd();
+  if (trimmed.endsWith(",")) {
+    out = trimmed.slice(0, -1);
+  } else if (trimmed.endsWith(":")) {
+    out = trimmed + "null";
+  }
+  for (let i = stack.length - 1; i >= 0; i--) out += stack[i];
+  try {
+    JSON.parse(out);
+    return out;
+  } catch {
+    return "{}";
+  }
 }
 
 /**
  * Estimate whether tool-call arguments JSON is truncated.
- * Checks by attempting to parse and looking for unbalanced braces/brackets.
  */
 export function isTruncatedJSON(text: string): boolean {
   if (!text) return false;
   try {
     JSON.parse(text);
-    return false; // Parsed fine
+    return false;
   } catch {
-    // If it ends without closing all braces/brackets, it's truncated.
-    const openBraces = (text.match(/\{/g) || []).length;
-    const closeBraces = (text.match(/\}/g) || []).length;
-    const openBrackets = (text.match(/\[/g) || []).length;
-    const closeBrackets = (text.match(/\]/g) || []).length;
-    return openBraces > closeBraces || openBrackets > closeBrackets;
+    // Use string-aware closer to determine if repairable truncation
+    const repaired = closeTruncatedJSON(text);
+    if (repaired === text) return false;
+    try {
+      JSON.parse(repaired);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
 /**
  * Attempt to repair truncated JSON by closing open braces/brackets.
+ * Handles unterminated strings, dangling comma/colon, fallback to {}.
  */
 export function repairTruncatedJSON(text: string): {
   repaired: string;
   fixed: boolean;
 } {
-  if (!isTruncatedJSON(text)) {
-    return { repaired: text, fixed: false };
-  }
-
-  let result = text;
-  const openBraces = (result.match(/\{/g) || []).length;
-  const closeBraces = (result.match(/\}/g) || []).length;
-  const openBrackets = (result.match(/\[/g) || []).length;
-  const closeBrackets = (result.match(/\]/g) || []).length;
-
-  // Close brackets first (innermost), then braces (outermost)
-  for (let i = 0; i < openBrackets - closeBrackets; i++) {
-    result += "]";
-  }
-  for (let i = 0; i < openBraces - closeBraces; i++) {
-    result += "}";
-  }
-
-  // Remove trailing commas that would invalidate JSON
-  result = result.replace(/,\s*([}\]])/g, "$1");
-
+  if (!text) return { repaired: text, fixed: false };
   try {
-    JSON.parse(result);
-    return { repaired: result, fixed: true };
+    JSON.parse(text);
+    return { repaired: text, fixed: false };
+  } catch {
+    // Try robust closer
+  }
+  const repaired = closeTruncatedJSON(text);
+  if (repaired === text) return { repaired: text, fixed: false };
+  try {
+    JSON.parse(repaired);
+    return { repaired, fixed: true };
   } catch {
     return { repaired: text, fixed: false };
   }
@@ -251,8 +263,6 @@ export interface RepairResult {
  * 1. Scavenge — recover tool calls leaked into reasoning_content
  * 2. Repair truncated JSON in arguments
  * 3. Detect and break call-storms
- *
- * Schema flattening is handled at tool registration time (not runtime).
  */
 export function repairToolCalls(
   calls: ToolCallRepairInput[],

@@ -79,7 +79,6 @@ DeepSeek's chat-completion API has known edge cases in tool-call generation that
 | Failure Mode | How Reasonix Repairs It |
 |---|---|
 | Tool calls emitted *inside* `<think>` reasoning blocks instead of as structured tool_calls | Scavenged via regex parsing of the reasoning content, then injected as proper tool_calls in the next request |
-| Deeply nested or wide JSON schemas (>10 parameters) causing truncation | Flattened to dot-notation keys to reduce depth and width |
 | Truncated JSON mid-structure (missing closing braces/brackets) | Auto-closed via a JSON repair parser at `message_end` — the repaired arguments are what Pi executes (same object reference the dispatcher reads) |
 | Identical tool-call + argument combinations repeated back-to-back (call-storm) | Detected via content hashing; duplicated calls are suppressed from the message before execution |
 
@@ -228,8 +227,8 @@ pi-reasonix/
 ├── src/
 │   ├── cache-first.ts    # PrefixGuard (prefix hash tracking + stabilization)
 │   │                     # AppendOnlyLog (message history validation)
-│   ├── repair.ts         # 4-pass tool-call repair pipeline
-│   │                     #   (scavenge, truncation repair, flatten, storm detection)
+│   ├── repair.ts         # 3-pass tool-call repair pipeline
+│   │                     #   (scavenge, truncation repair, storm detection)
 │   ├── cost-control.ts   # Tool-result compaction, context estimation
 │   └── types.ts          # Shared interfaces and type definitions
 ├── test/
@@ -298,7 +297,7 @@ Reasonix is a DeepSeek-native agent framework that pioneered these specific opti
 pi-reasonix is a **structural translation** of Reasonix's core algorithms into Pi's extension architecture:
 
 - The `PrefixGuard` and `AppendOnlyLog` classes in `src/cache-first.ts` mirror Reasonix's immutable prefix + append-only log with adaptations for Pi's message ordering constraints
-- The tool-call repair pipeline in `src/repair.ts` follows Reasonix's 4-pass approach (scavenge, truncation repair, flatten, storm detection) with adjustments for Pi's streaming context
+- The tool-call repair pipeline in `src/repair.ts` follows Reasonix's 3-pass approach (scavenge, truncation repair, storm detection) with adjustments for Pi's streaming context
 - The cost-control logic in `src/cost-control.ts` adapts Reasonix's compaction thresholds to Pi's tool-result streaming
 - Pi-specific event wiring (`extensions/index.ts`) replaces Reasonix's internal provider hooks
 

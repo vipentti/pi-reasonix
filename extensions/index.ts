@@ -5,7 +5,7 @@
  * Reasonix (esengine/DeepSeek-Reasonix):
  *
  *   Pillar 1 — Cache-First Loop (prefix stabilisation → ~94% cache hit)
- *   Pillar 2 — Tool-Call Repair (scavenge, flatten, truncation, storm)
+ *   Pillar 2 — Tool-Call Repair (scavenge, truncation, storm)
  *   Pillar 3 — Cost Control (turn-end compaction, flash-first)
  *
  * The extension activates automatically when the current model is a

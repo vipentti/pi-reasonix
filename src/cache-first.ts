@@ -19,6 +19,44 @@
 import type { DeepSeekChatMessage, PrefixHash } from "./types.js";
 
 /**
+ * Normalize tool schemas to a deterministic order before hashing.
+ * Mirrors original normalizeToolSchemas (cache_shape.go): sort by name,
+ * description, then JSON-stringified parameters. Copy first, do not mutate.
+ */
+export function normalizeToolSchemas(tools: unknown[]): unknown[] {
+  const out = [...tools];
+  out.sort((a, b) => {
+    const ka = toolSortKey(a);
+    const kb = toolSortKey(b);
+    if (ka.name !== kb.name) return ka.name < kb.name ? -1 : 1;
+    if (ka.desc !== kb.desc) return ka.desc < kb.desc ? -1 : 1;
+    if (ka.params !== kb.params) return ka.params < kb.params ? -1 : 1;
+    return 0;
+  });
+  return out;
+}
+
+function toolSortKey(tool: unknown): { name: string; desc: string; params: string } {
+  if (tool && typeof tool === "object") {
+    const t = tool as Record<string, unknown>;
+    const fn = t.function as Record<string, unknown> | undefined;
+    if (fn && typeof fn === "object") {
+      return {
+        name: String(fn.name ?? ""),
+        desc: String(fn.description ?? ""),
+        params: JSON.stringify(fn.parameters ?? ""),
+      };
+    }
+    return {
+      name: String(t.name ?? ""),
+      desc: String(t.description ?? ""),
+      params: JSON.stringify((t as Record<string, unknown>).parameters ?? ""),
+    };
+  }
+  return { name: "", desc: "", params: JSON.stringify(tool ?? "") };
+}
+
+/**
  * Compute a stable hash for a value using a fast non-crypto algorithm.
  * DeepSeek's cache is byte-prefix based, so we just need a deterministic
  * fingerprint to detect changes.
@@ -74,7 +112,8 @@ export class PrefixGuard {
 
     const systemHash = fastHash(systemText);
     // Hash the *tool definitions* (stable), not tool calls (append-only).
-    const toolsHash = fastHash(JSON.stringify(tools ?? []));
+    const normalizedTools = normalizeToolSchemas(tools ?? []);
+    const toolsHash = fastHash(JSON.stringify(normalizedTools));
     const prefixHash = fastHash(systemHash + "|" + toolsHash);
 
     // Always re-emit system first if it exists.
