@@ -22,7 +22,7 @@ import type {
   ExtensionCommandContext,
   BeforeProviderRequestEvent,
   TurnEndEvent,
-} from "@earendil-works/Pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { PrefixGuard, AppendOnlyLog } from "../src/cache-first.js";
 import {
   compactToolResults,

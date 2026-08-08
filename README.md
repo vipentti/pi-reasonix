@@ -138,7 +138,7 @@ The extension is tolerant of both metric sources and never double counts:
 
 ```bash
 # From npm (once published)
-pi install @thetrebor/pi-reasonix
+pi install pi-reasonix
 
 # Or from local checkout
 pi install /path/to/pi-reasonix
@@ -258,7 +258,7 @@ npm install
 # Compile TypeScript → dist/
 npm run build
 
-# Run test suite (21 tests: unit + integration; builds dist/ first)
+# Run test suite (22 tests: unit + integration; builds dist/ first)
 npm test
 ```
 
@@ -302,7 +302,7 @@ pi-reasonix is a **structural translation** of Reasonix's core algorithms into P
 - The cost-control logic in `src/cost-control.ts` adapts Reasonix's compaction thresholds to Pi's tool-result streaming
 - Pi-specific event wiring (`extensions/index.ts`) replaces Reasonix's internal provider hooks
 
-All 27 tests in the test suite validate that the translated algorithms preserve Reasonix's original behavior and correctness.
+All 22 tests in the test suite validate that the translated algorithms preserve Reasonix's original behavior and correctness.
 
 ### Why not just use Reasonix directly?
 
