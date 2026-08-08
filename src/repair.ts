@@ -114,91 +114,191 @@ export function repairTruncatedJSON(text: string): {
 /* ------------------------------------------------------------------ */
 
 /**
+ * Options for scavengeToolCalls.
+ */
+export interface ScavengeOptions {
+  /**
+   * Tool names the session actually exposes (e.g. the tools list seen at
+   * `before_provider_request`). When provided, only calls whose name is
+   * present are kept. When omitted or empty, extraction keeps every
+   * structurally valid call — strict JSON validation still applies.
+   */
+  knownTools?: Iterable<string> | null | undefined;
+}
+
+/**
  * Scavenge tool calls that DeepSeek "leaked" into reasoning_content or
  * message content (outside the tool_calls array).
+ *
+ * A candidate is only emitted when it is structurally valid: a string
+ * `name` and `arguments` that parse as valid JSON (object arguments are
+ * serialized). Malformed candidates are dropped, never emitted.
  */
 export function scavengeToolCalls(
   content: string | null | undefined,
+  options: ScavengeOptions = {},
 ): ToolCallRepairInput[] {
   if (!content) return [];
 
+  const known = options.knownTools ? new Set(options.knownTools) : null;
+
+  // Pattern 1: tool_use blocks inside <think> tags.
+  // DeepSeek often emits tool call JSON inside reasoning blocks.
+  const thinkContents: string[] = [];
+  for (const m of content.matchAll(/<think>([\s\S]*?)<\/think>/g)) {
+    thinkContents.push(m[1]);
+  }
+
+  // Pattern 2: tool calls embedded in markdown code fences.
+  const fenceContents: string[] = [];
+  for (const m of content.matchAll(/```(?:json)?\s*\n?([\s\S]*?)```/g)) {
+    fenceContents.push(m[1]);
+  }
+
+  // Pattern 3: bare tool calls inline in the response text — only when no
+  // <think> block matched, mirroring the original pass.
+  const regions: string[] = [...thinkContents, ...fenceContents];
+  if (thinkContents.length === 0) regions.push(content);
+
   const found: ToolCallRepairInput[] = [];
-
-  // Pattern 1: tool_use blocks inside <think> tags
-  // DeepSeek often emits tool call JSON inside reasoning blocks
-  const thinkPattern = /<think>([\s\S]*?)<\/think>/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = thinkPattern.exec(content)) !== null) {
-    const thinkContent = match[1];
-    const scavenged = extractToolCallsFromText(thinkContent);
-    found.push(...scavenged);
-  }
-
-  // Pattern 2: tool calls embedded in markdown code fences
-  const fencePattern = /```(?:json)?\s*\n?([\s\S]*?)```/g;
-  while ((match = fencePattern.exec(content)) !== null) {
-    const fenceContent = match[1];
-    const scavenged = extractToolCallsFromText(fenceContent);
-    found.push(...scavenged);
-  }
-
-  // Pattern 3: bare tool calls inline in the response text
-  if (!thinkPattern.test(content)) {
-    // Only if we didn't already find through thinks
-    const inlineScavenged = extractToolCallsFromText(content);
-    found.push(...inlineScavenged);
+  const seen = new Set<string>();
+  for (const region of regions) {
+    for (const obj of extractJsonObjects(region)) {
+      const call = normalizeScavengedCall(obj);
+      if (!call) continue;
+      if (known && !known.has(call.function.name)) continue;
+      const key = callKey(call.function.name, call.function.arguments);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      found.push({
+        ...call,
+        id: call.id || `scavenged-${found.length}`,
+      });
+    }
   }
 
   return found;
 }
 
-function extractToolCallsFromText(text: string): ToolCallRepairInput[] {
-  const found: ToolCallRepairInput[] = [];
+/**
+ * Deterministic key for a (name, serialized arguments) tool-call tuple.
+ * Shared by scavenge de-duplication and storm detection.
+ */
+export function callKey(name: string, argumentsStr: string): string {
+  return `${name}|${argumentsStr}`;
+}
 
-  // Look for JSON objects with function/name/arguments patterns
-  const jsonPattern = /(?:```json\s*)?(\{[\s\S]*?"function"[\s\S]*?\})/g;
-  let m: RegExpExecArray | null;
-  while ((m = jsonPattern.exec(text)) !== null) {
+/**
+ * Find every complete JSON object in `text` that looks like a tool call
+ * (`{"function": {...}}` or `{"name": ..., "arguments": ...}`), returned as
+ * the parsed object. Objects are matched by balanced braces (string-aware),
+ * so nested-argument calls and string-form arguments are handled — unlike
+ * the old non-greedy regex which cut on the first `}`.
+ */
+function extractJsonObjects(text: string): unknown[] {
+  const objects: unknown[] = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const start = text.indexOf("{", pos);
+    if (start === -1) break;
+    const end = findJsonObjectEnd(text, start);
+    if (end === -1) break; // unbalanced — no complete object left
+    const raw = text.slice(start, end + 1);
+    let parsed: unknown;
     try {
-      const obj = JSON.parse(m[1]);
-      if (obj.function?.name && obj.function?.arguments) {
-        found.push({
-          id: obj.id || `scavenged-${found.length}`,
-          type: "function",
-          function: {
-            name: obj.function.name,
-            arguments:
-              typeof obj.function.arguments === "string"
-                ? obj.function.arguments
-                : JSON.stringify(obj.function.arguments),
-          },
-        });
+      parsed = JSON.parse(raw);
+    } catch {
+      pos = end + 1; // malformed object — drop and move on
+      continue;
+    }
+    if (isToolCallShape(parsed)) {
+      objects.push(parsed);
+      pos = end + 1; // skip the matched object's interior so nested
+      // bare-form look-alikes are not scavenged twice
+    } else {
+      // A non-tool object may still wrap a tool call — scan its interior.
+      objects.push(...extractJsonObjects(raw.slice(1, -1)));
+      pos = end + 1;
+    }
+  }
+  return objects;
+}
+
+/**
+ * Index of the closing brace for the object that opens at `start`,
+ * respecting string literals and escapes. -1 when unbalanced.
+ */
+function findJsonObjectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) {
+        esc = false;
+      } else if (c === "\\") {
+        esc = true;
+      } else if (c === '"') {
+        inStr = false;
       }
-    } catch {
-      // Not valid JSON, skip
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+    } else if (c === "{") {
+      depth++;
+    } else if (c === "}") {
+      depth--;
+      if (depth === 0) return i;
     }
   }
+  return -1;
+}
 
-  // Also look for bare {"name": "...", "arguments": {...}} patterns
-  const barePattern = /\{"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\}/g;
-  while ((m = barePattern.exec(text)) !== null) {
+/** True when the parsed object carries a tool-call shape. */
+function isToolCallShape(obj: unknown): boolean {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  const o = obj as Record<string, unknown>;
+  const f = (o.function as Record<string, unknown> | undefined) ?? o;
+  return (
+    typeof f?.name === "string" &&
+    f.name.length > 0 &&
+    "arguments" in f
+  );
+}
+
+/**
+ * Convert a parsed tool-call object into a repair input, or null when it is
+ * malformed: non-string/empty name, or arguments that are neither a valid
+ * JSON string nor an object.
+ */
+function normalizeScavengedCall(obj: unknown): ToolCallRepairInput | null {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  const o = obj as Record<string, unknown>;
+  const f = (o.function as Record<string, unknown> | undefined) ?? o;
+  const name = f?.name;
+  if (typeof name !== "string" || name.length === 0) return null;
+  const args = f?.arguments;
+  let argumentsStr: string;
+  if (typeof args === "string") {
     try {
-      const args = JSON.parse(m[2]);
-      found.push({
-        id: `scavenged-bare-${found.length}`,
-        type: "function",
-        function: {
-          name: m[1],
-          arguments: JSON.stringify(args),
-        },
-      });
+      JSON.parse(args); // must parse as valid JSON
     } catch {
-      // Skip
+      return null;
     }
+    argumentsStr = args;
+  } else if (args !== null && typeof args === "object") {
+    argumentsStr = JSON.stringify(args);
+  } else {
+    return null;
   }
-
-  return found;
+  const id = typeof o.id === "string" && o.id.length > 0 ? o.id : "";
+  return {
+    id,
+    type: "function",
+    function: { name, arguments: argumentsStr },
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -206,16 +306,40 @@ function extractToolCallsFromText(text: string): ToolCallRepairInput[] {
 /* ------------------------------------------------------------------ */
 
 /**
+ * How many times the same call repeat may be suppressed before a
+ * `[loop guard]` notice is appended to the message so the suppression is
+ * visible to the model instead of silent (mirrors the original's
+ * stormBreakThreshold = 3, two natural self-corrections then escalate).
+ */
+export const STORM_BREAK_THRESHOLD = 3;
+
+export interface StormResult {
+  clean: ToolCallRepairInput[];
+  stormCount: number;
+  /** Keys (name|args) of the calls that were suppressed. */
+  suppressedKeys: string[];
+}
+
+/**
  * Detect call-storms: same (tool, args) tuple within a sliding window.
- * Returns the number of storms detected (the excess calls to suppress).
+ * Returns the calls to keep, the number of suppressed calls, and the keys
+ * of the suppressed calls.
+ *
+ * Keying is exact (name, serialized arguments). A (name, errorClass)
+ * dimension is not added because pi does not expose tool-execution error
+ * class at the available hook: `message_end` assistant messages carry only
+ * `name` + `arguments` on toolCall blocks, and tool results arrive later as
+ * separate `toolResult` messages with just a boolean `isError`. Re-worded-
+ * argument loops on a failing tool are therefore not catchable here.
  */
 export function detectCallStorm(
   calls: ToolCallRepairInput[],
   windowSize = 5,
-): { clean: ToolCallRepairInput[]; stormCount: number } {
-  if (calls.length < 2) return { clean: calls, stormCount: 0 };
+): StormResult {
+  if (calls.length < 2) return { clean: calls, stormCount: 0, suppressedKeys: [] };
 
   const clean: ToolCallRepairInput[] = [calls[0]];
+  const suppressedKeys: string[] = [];
   let stormCount = 0;
 
   for (let i = 1; i < calls.length; i++) {
@@ -228,13 +352,35 @@ export function detectCallStorm(
 
     if (isDuplicate) {
       stormCount++;
+      suppressedKeys.push(
+        callKey(calls[i].function.name, calls[i].function.arguments),
+      );
       // Suppress this call — don't add to clean
     } else {
       clean.push(calls[i]);
     }
   }
 
-  return { clean, stormCount };
+  return { clean, stormCount, suppressedKeys };
+}
+
+/**
+ * Track per-key suppression counts and report which keys crossed the
+ * loop-guard threshold on this pass. `counts` is mutated and persists across
+ * calls so a death-spiral spanning several messages is still caught.
+ */
+export function escalateLoopGuards(
+  suppressedKeys: string[],
+  counts: Map<string, number>,
+  threshold = STORM_BREAK_THRESHOLD,
+): string[] {
+  const flagged: string[] = [];
+  for (const key of suppressedKeys) {
+    const next = (counts.get(key) ?? 0) + 1;
+    counts.set(key, next);
+    if (next === threshold) flagged.push(key);
+  }
+  return flagged;
 }
 
 /* ------------------------------------------------------------------ */

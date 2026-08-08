@@ -50,6 +50,7 @@ export interface ReasonixStats {
   callsRepaired: number;
   callsScavenged: number;
   stormsSuppressed: number;
+  loopGuardNotices: number;
   /** Cost control. */
   resultsCompacted: number;
   /** Conversation truncation events (pi compacted history). */
